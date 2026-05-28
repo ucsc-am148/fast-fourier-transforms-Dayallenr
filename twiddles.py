@@ -33,8 +33,12 @@ def make_radix2_twiddles(
     Used by the radix-2 butterfly: stage s reads twiddle at index
     (k & (2**s - 1)) * (N >> (s+1)), so the table only needs the lower half
     of one full period."""
-    raise NotImplementedError("TODO: implement make_radix2_twiddles")
-
+    # TODO
+    k = torch.arange(N // 2, dtype=torch.float64)
+    angles = -2.0 * math.pi * k / N
+    tw_re = torch.cos(angles).to(dtype).to(device)
+    tw_im = torch.sin(angles).to(dtype).to(device)
+    return tw_re, tw_im
 
 # =============================================================================
 # Pattern 2: per-stage radix-16 twiddles  (F4; reused by F5/F6/F7 via F4)
@@ -79,7 +83,56 @@ def make_radix16_twiddles(
     where e_{L-1-j}_value(c) reads the base-16 digit of c at the position
     given by _column_axis_labeling(L)[s].
     """
-    raise NotImplementedError("TODO: implement make_radix16_twiddles")
+    # TODO
+    L = int(round(math.log(N, 16)))
+    assert 16 ** L == N
+    cols_per_stage = N // 16  # = 16^(L-1)
+    
+    # Shape: (L, 16, cols_per_stage)
+    tw_re = torch.ones(L, 16, cols_per_stage, dtype=torch.float16, device=device)
+    tw_im = torch.zeros(L, 16, cols_per_stage, dtype=torch.float16, device=device)
+    
+    # Stage 0: all ones (kernel skips multiply at s=0)
+    # Stages s > 0: build from column axis labeling
+    labeling = _column_axis_labeling(L)
+    
+    for s in range(1, L):
+        # labeling[s] gives the L-1 axis labels at positions 1..L-1 after stage-s permute
+        # These are the already-transformed output digits
+        col_labels = labeling[s]  # tuple of L-1 labels
+        # col_labels[j] = ('e', L-1-j) for j = 0..s-1, then remaining 'd' labels
+        # The column index c encodes these L-1 digits in base 16
+        # t = sum_{j=0}^{s-1} digit_of_col_at_e_{L-1-j} * 16^j
+        # The column index c is an index in [0, 16^(L-1))
+        # We need to extract digits from c based on col_labels
+        
+        c = torch.arange(cols_per_stage, dtype=torch.float64)
+        m = torch.arange(16, dtype=torch.float64)
+        
+        # Compute t from column index c
+        # col_labels gives the ordering of axes at positions 1..L-1
+        # We need to read out the first s digits (which are 'e' type = already transformed)
+        # These correspond to position j=0..s-1 in col_labels, contributing * 16^j
+        # The col index c encodes axes in order col_labels[0], col_labels[1], ...
+        # i.e., c = d_0 * 16^(L-2) + d_1 * 16^(L-3) + ... + d_{L-2} * 16^0
+        # (high digit first)
+        
+        t = torch.zeros(cols_per_stage, dtype=torch.float64)
+        for j in range(s):
+            # col_labels[j] is at position j (0-indexed among the L-1 column axes)
+            # The digit at position j in c is: (c // 16^(L-2-j)) % 16
+            power = (L - 2 - j)
+            digit_j = (c.long() // (16 ** power)) % 16
+            t = t + digit_j.double() * (16.0 ** j)
+        
+        # tw[s, m, c] = exp(-2*pi*i * m * t(c) / 16^(s+1))
+        denom = 16.0 ** (s + 1)
+        # outer product over m and c
+        angle = -2.0 * math.pi * m.unsqueeze(1) * t.unsqueeze(0) / denom  # (16, cols)
+        tw_re[s] = angle.cos().to(torch.float16)
+        tw_im[s] = angle.sin().to(torch.float16)
+    
+    return tw_re, tw_im
 
 
 # =============================================================================
@@ -100,7 +153,14 @@ def make_bailey_cross_twiddles(
     F5/F6/F7 call it with dtype=torch.float16 (the tcFFT tier is fp16). The
     Bailey identity holds for any N >= m0 * M; in practice N == m0 * M.
     """
-    raise NotImplementedError("TODO: implement make_bailey_cross_twiddles")
+    # TODO
+    n1 = torch.arange(m0, dtype=torch.float64)
+    kM = torch.arange(M, dtype=torch.float64)
+    # outer product
+    angles = -2.0 * math.pi * n1.unsqueeze(1) * kM.unsqueeze(0) / N
+    bt_re = angles.cos().to(dtype).to(device)
+    bt_im = angles.sin().to(dtype).to(device)
+    return bt_re, bt_im
 
 
 # =============================================================================
@@ -116,7 +176,13 @@ def make_dft_matrix(
 
     W[j, k] = exp(-2*pi*i * j * k / N). Used by F1 (DFT-as-complex-matmul).
     """
-    raise NotImplementedError("TODO: implement make_dft_matrix")
+    # TODO
+    j = torch.arange(N, dtype=torch.float64)
+    k = torch.arange(N, dtype=torch.float64)
+    angles = -2.0 * math.pi * j.unsqueeze(1) * k.unsqueeze(0) / N
+    W_re = angles.cos().to(dtype).to(device)
+    W_im = angles.sin().to(dtype).to(device)
+    return W_re, W_im
 
 
 def make_dft_R_padded(
@@ -129,7 +195,18 @@ def make_dft_R_padded(
     first R columns are F_R (rows wrap mod R), take the first R output rows.
     This makes the >=16x16 tl.dot requirement hold for all R in {2, 4, 8, 16}.
     """
-    raise NotImplementedError("TODO: implement make_dft_R_padded")
+    # TODO
+    j = torch.arange(R, dtype=torch.float64)
+    k = torch.arange(R, dtype=torch.float64)
+    angles = -2.0 * math.pi * j.unsqueeze(1) * k.unsqueeze(0) / R
+    F_re = angles.cos()
+    F_im = angles.sin()
+
+    M_re = torch.zeros(16, 16, dtype=torch.float16, device=device)
+    M_im = torch.zeros(16, 16, dtype=torch.float16, device=device)
+    M_re[:R, :R] = F_re.to(torch.float16)
+    M_im[:R, :R] = F_im.to(torch.float16)
+    return M_re, M_im
 
 
 def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
@@ -138,4 +215,17 @@ def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
     rev[i] is the integer whose n_bits=log2(N) binary representation is i's
     bits in reversed order.
     """
-    raise NotImplementedError("TODO: implement bit_reversal_perm")
+    # TODO
+    n_bits = int(round(math.log2(N)))
+    assert 2 ** n_bits == N
+    indices = torch.arange(N, dtype=torch.int32)
+    # Reverse bits
+    result = torch.zeros(N, dtype=torch.int32)
+    for i in range(N):
+        x = i
+        rev = 0
+        for _ in range(n_bits):
+            rev = (rev << 1) | (x & 1)
+            x >>= 1
+        result[i] = rev
+    return result.to(device)
