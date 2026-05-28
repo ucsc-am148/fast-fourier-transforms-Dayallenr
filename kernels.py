@@ -47,8 +47,6 @@ def _cdot(a_re, a_im, b_re, b_im):
     Used by f1_kernel, f4_kernel_L2, and dft_kernel. Don't reimplement the
     four-tl.dot expansion at each call site -- implement once here, call
     everywhere.
-
-    TODO: implement.
     """
     y_re = tl.dot(a_re, b_re, out_dtype=tl.float32) - tl.dot(a_im, b_im, out_dtype=tl.float32)
     y_im = tl.dot(a_re, b_im, out_dtype=tl.float32) + tl.dot(a_im, b_re, out_dtype=tl.float32)
@@ -70,7 +68,6 @@ def f6_factor(N: int) -> list[int]:
         65536 -> [256, 256]         1048576 -> [256, 256, 16]
         64 -> [16, 4]               2 -> [2]
     """
-    # TODO
     assert N >= 2 and (N & (N - 1)) == 0, f"N must be a power of 2 >= 2; got {N}"
     k = N.bit_length() - 1
     n256, rb = divmod(k, 8)
@@ -111,8 +108,6 @@ def f1_kernel(
     `out_dtype=tl.float32` (handled by `_cdot`), accumulator is fp32, store
     is fp32. Allocations in `f1_alloc` already match this -- x_re/x_im are
     fp16, y_re/y_im are fp32.
-
-    TODO: implement.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -152,8 +147,6 @@ def f1_launch(x_re, x_im, W_re, W_im, y_re, y_im):
     """Grid: (cdiv(B, BLOCK_M), cdiv(N, BLOCK_N)). One program tiles a
     (BLOCK_M, BLOCK_N) output square. tl.dot needs all three dims >=16, so B
     should be >= 16.
-
-    TODO: implement.
     """
     B, N = x_re.shape
     BLOCK_M = 16
@@ -200,8 +193,6 @@ def f2_kernel(
 ):
     """Radix-2 Cooley-Tukey FFT in registers, with optional Bailey epilogue and
     strided store. log2(N) butterfly stages via tl.gather for partner shuffle.
-
-    TODO: implement.
     """
     pid = tl.program_id(0)
  
@@ -242,16 +233,22 @@ def f2_kernel(
         p_re = tl.gather(v_re, partner, 0)
         p_im = tl.gather(v_im, partner, 0)
  
-        # Complex multiply: w * p
-        wp_re = tw_re * p_re - tw_im * p_im
-        wp_im = tw_re * p_im + tw_im * p_re
- 
-        # Butterfly: if (idx & half) == 0: v = v + wp, else v = v - wp (from partner's perspective)
+        # Isolate top and bottom threads for correctness
         is_lo = (idx & half) == 0
-        new_re = tl.where(is_lo, v_re + wp_re, v_re - wp_re)
-        new_im = tl.where(is_lo, v_im + wp_im, v_im - wp_im)
-        v_re = new_re
-        v_im = new_im
+
+        # Grab the correct top and bottom values regardless of thread identity
+        top_re = tl.where(is_lo, v_re, p_re)
+        top_im = tl.where(is_lo, v_im, p_im)
+        bot_re = tl.where(is_lo, p_re, v_re)
+        bot_im = tl.where(is_lo, p_im, v_im)
+
+        # Complex multiply: Twiddle ALWAYS multiplies the bottom element
+        wp_re = tw_re * bot_re - tw_im * bot_im
+        wp_im = tw_re * bot_im + tw_im * bot_re
+
+        # Top gets Top + W*Bot, Bottom gets Top - W*Bot
+        v_re = tl.where(is_lo, top_re + wp_re, top_re - wp_re)
+        v_im = tl.where(is_lo, top_im + wp_im, top_im - wp_im)
  
     # Bailey epilogue: multiply by cross-twiddle bt[n1, k2]
     if BAILEY_EPILOGUE:
@@ -281,11 +278,8 @@ def f2_kernel(
             tl.store(y_im_ptr + b * N + idx, v_im)
 
 
-
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
     """Grid: (B,). One program per length-N signal. Vanilla mode.
-
-    TODO: implement.
     """
     B, N = x_re.shape
     LOG2_N = int(math.log2(N))
@@ -312,8 +306,6 @@ def transpose_kernel(
 ):
     """Logical (B, R, C) -> (B, C, R) transpose. Grid: (cdiv(R, BLOCK_R),
     cdiv(C, BLOCK_C), B). Each program copies a (BLOCK_R, BLOCK_C) tile.
-
-    TODO: implement.
     """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -382,8 +374,6 @@ def f4_kernel_L2(
         perm = (1, 0, 2); tl.permute(x, perm)     # fails
     Inline each stage's permute tuple at the call site; don't store the
     schedule in a loop variable.
-
-    TODO: implement.
     """
     pid = tl.program_id(0)
     b_start = pid * BLOCK_B
@@ -394,102 +384,101 @@ def f4_kernel_L2(
     F_re = tl.load(F_re_ptr + tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :])
     F_im = tl.load(F_im_ptr + tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :])
  
-    # Load input: (BLOCK_B, 256) fp16
+    # Load input: (BLOCK_B, 256) fp16 -> logically (BLOCK_B, 16, 16) with axes [Batch, d0, d1]
     mask = b_offs[:, None] < B
     x_re = tl.load(x_re_ptr + b_offs[:, None] * 256 + n_offs[None, :], mask=mask, other=0.0)
     x_im = tl.load(x_im_ptr + b_offs[:, None] * 256 + n_offs[None, :], mask=mask, other=0.0)
- 
-    # Reshape to (BLOCK_B, 16, 16): x[b, d0, d1] with d0=high digit, d1=low digit
-    # In memory: n = d0*16 + d1, so tile[b, d0, d1] = x[b, d0*16 + d1]
     x_re = tl.reshape(x_re, (BLOCK_B, 16, 16))
     x_im = tl.reshape(x_im, (BLOCK_B, 16, 16))
- 
-    # Stage s=0: permute so axis 0 (d0) is first (already there), DFT along d0
-    # Permute: (BLOCK_B, d0, d1) -> (BLOCK_B, d0, d1) [no change at s=0, d0 is axis 1]
-    # Actually we need to bring axis s to position 1 (first of the 2 tile dims)
-    # At s=0: tile is (BLOCK_B, d0, d1), we want d0 at position 1 -> already there
-    # DFT along axis 1 (d0): matmul (16, BLOCK_B*16) vs (16, 16) F
-    # Reshape to (16, BLOCK_B*16) for the matmul, apply F along rows
-    tile_re = tl.reshape(x_re, (16, BLOCK_B * 16))
-    tile_im = tl.reshape(x_im, (16, BLOCK_B * 16))
-    # y = F @ x: (16, 16) @ (16, BLOCK_B*16) -> (16, BLOCK_B*16)
+
+    # =========================================================================
+    # STAGE 0: Transform d0 (axis 1)
+    # =========================================================================
+    # 1. Permute target axis d0 to axis 0: [Batch, d0, d1] -> [d0, Batch, d1]
+    x_re_perm = tl.permute(x_re, (1, 0, 2)) 
+    x_im_perm = tl.permute(x_im, (1, 0, 2))
+    
+    # 2. Reshape to 2D for matmul: (16, BLOCK_B * 16)
+    tile_re = tl.reshape(x_re_perm, (16, BLOCK_B * 16))
+    tile_im = tl.reshape(x_im_perm, (16, BLOCK_B * 16))
+    
+    # 3. Matmul: F @ tile
     out_re, out_im = _cdot(F_re, F_im, tile_re, tile_im)
-    # Cast to fp16 for next stage
     out_re = out_re.to(tl.float16)
     out_im = out_im.to(tl.float16)
-    # Reshape back to (BLOCK_B, 16, 16): now axis 1 = e1 (output digit for s=0: e_{L-1-0}=e_1)
-    # After s=0 stage, tile is (e1, BLOCK_B, d1) -> need to reshape to (BLOCK_B, e1, d1)
+    
+    # 4. Reshape back: [e1, Batch, d1]
     out_re = tl.reshape(out_re, (16, BLOCK_B, 16))
     out_im = tl.reshape(out_im, (16, BLOCK_B, 16))
-    # Permute to (BLOCK_B, e1, d1)
+    
+    # 5. Permute Batch back to axis 0: [Batch, e1, d1]
     out_re = tl.permute(out_re, (1, 0, 2))
     out_im = tl.permute(out_im, (1, 0, 2))
- 
+
     if STAGE_STOP == 1:
-        # Store result after stage 0 only: flatten (BLOCK_B, 16, 16) -> (BLOCK_B, 256)
-        out_re = tl.reshape(out_re, (BLOCK_B, 256))
-        out_im = tl.reshape(out_im, (BLOCK_B, 256))
-        tl.store(y_re_ptr + b_offs[:, None] * 256 + n_offs[None, :], out_re, mask=mask)
-        tl.store(y_im_ptr + b_offs[:, None] * 256 + n_offs[None, :], out_im, mask=mask)
+        # Flatten and store using temporary variables to avoid type poisoning
+        out_re_flat = tl.reshape(out_re, (BLOCK_B, 256))
+        out_im_flat = tl.reshape(out_im, (BLOCK_B, 256))
+        tl.store(y_re_ptr + b_offs[:, None] * 256 + n_offs[None, :], out_re_flat, mask=mask)
+        tl.store(y_im_ptr + b_offs[:, None] * 256 + n_offs[None, :], out_im_flat, mask=mask)
+        return
+
+    # =========================================================================
+    # STAGE 1: Transform d1 (axis 2)
+    # =========================================================================
+    # 1. Bring d1 to position 1: [Batch, e1, d1] -> [Batch, d1, e1]
+    out_re = tl.permute(out_re, (0, 2, 1))
+    out_im = tl.permute(out_im, (0, 2, 1))
+
+    # 2. Apply Stage 1 Twiddles (elementwise)
+    tw1_re = tl.load(tw_re_ptr + 1 * 16 * 16 + tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :])
+    tw1_im = tl.load(tw_im_ptr + 1 * 16 * 16 + tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :])
+    
+    tw1_re_b = tl.reshape(tw1_re, (1, 16, 16))
+    tw1_im_b = tl.reshape(tw1_im, (1, 16, 16))
+    
+    tmp_re = out_re.to(tl.float32) * tw1_re_b.to(tl.float32) - out_im.to(tl.float32) * tw1_im_b.to(tl.float32)
+    tmp_im = out_re.to(tl.float32) * tw1_im_b.to(tl.float32) + out_im.to(tl.float32) * tw1_re_b.to(tl.float32)
+    t_re = tmp_re.to(tl.float16)
+    t_im = tmp_im.to(tl.float16)
+
+    # 3. DFT along axis 1 (d1). Same routine: permute d1 to front! -> [d1, Batch, e1]
+    t_re_perm = tl.permute(t_re, (1, 0, 2))
+    t_im_perm = tl.permute(t_im, (1, 0, 2))
+    
+    # 4. Reshape to 2D
+    t_re_flat = tl.reshape(t_re_perm, (16, BLOCK_B * 16))
+    t_im_flat = tl.reshape(t_im_perm, (16, BLOCK_B * 16))
+    
+    # 5. Matmul: F @ tile
+    out2_re, out2_im = _cdot(F_re, F_im, t_re_flat, t_im_flat)
+    out2_re = out2_re.to(tl.float16)
+    out2_im = out2_im.to(tl.float16)
+    
+    # 6. Reshape back: [e0, Batch, e1]
+    out2_re = tl.reshape(out2_re, (16, BLOCK_B, 16))
+    out2_im = tl.reshape(out2_im, (16, BLOCK_B, 16))
+    
+    # 7. Permute Batch back to axis 0: [Batch, e0, e1]
+    out2_re = tl.permute(out2_re, (1, 0, 2))
+    out2_im = tl.permute(out2_im, (1, 0, 2))
+
+    # =========================================================================
+    # STORE 
+    # =========================================================================
+    if STORE_T:
+        out_flat = tl.reshape(out2_re, (BLOCK_B, 256))
+        out_flat_im = tl.reshape(out2_im, (BLOCK_B, 256))
+        outer_b = b_offs // M
+        m_idx = b_offs % M
+        out_idx = outer_b[:, None] * (256 * M) + n_offs[None, :] * M + m_idx[:, None]
+        tl.store(y_re_ptr + out_idx, out_flat, mask=mask)
+        tl.store(y_im_ptr + out_idx, out_flat_im, mask=mask)
     else:
-        # Stage s=1: bring d1 (axis 2) to position 1
-        # Tile is (BLOCK_B, e1, d1), permute to (BLOCK_B, d1, e1)
-        out_re = tl.permute(out_re, (0, 2, 1))
-        out_im = tl.permute(out_im, (0, 2, 1))
- 
-        # Load stage-1 twiddles: tw[1, m, c] shape (16, 16)
-        # m = d1 index (position 1 in tile), c = e1 index (position 2)
-        tw1_re = tl.load(tw_re_ptr + 1 * 16 * 16 + tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :])
-        tw1_im = tl.load(tw_im_ptr + 1 * 16 * 16 + tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :])
- 
-        # Apply twiddle: tile shape (BLOCK_B, d1=16, e1=16)
-        # tw1[d1, e1] = tw[1, m=d1, c=e1]
-        # Multiply: (BLOCK_B, 16, 16) elementwise with (16, 16) broadcast over batch
-        t_re = tl.reshape(out_re, (BLOCK_B, 16, 16))
-        t_im = tl.reshape(out_im, (BLOCK_B, 16, 16))
-        # twiddle broadcast: (1, 16, 16)
-        tw1_re_b = tl.reshape(tw1_re, (1, 16, 16))
-        tw1_im_b = tl.reshape(tw1_im, (1, 16, 16))
-        # complex multiply
-        tmp_re = t_re.to(tl.float32) * tw1_re_b.to(tl.float32) - t_im.to(tl.float32) * tw1_im_b.to(tl.float32)
-        tmp_im = t_re.to(tl.float32) * tw1_im_b.to(tl.float32) + t_im.to(tl.float32) * tw1_re_b.to(tl.float32)
-        t_re = tmp_re.to(tl.float16)
-        t_im = tmp_im.to(tl.float16)
- 
-        # DFT along axis 1 (d1): (BLOCK_B, d1, e1) -> F @ each (d1, e1) slice
-        # Reshape to (16, BLOCK_B*16) for matmul
-        t_re_flat = tl.reshape(t_re, (16, BLOCK_B * 16))
-        t_im_flat = tl.reshape(t_im, (16, BLOCK_B * 16))
-        out2_re, out2_im = _cdot(F_re, F_im, t_re_flat, t_im_flat)
-        out2_re = out2_re.to(tl.float16)
-        out2_im = out2_im.to(tl.float16)
-        # Shape is now (e0=16, BLOCK_B*e1=BLOCK_B*16)
-        # Reshape to (e0, BLOCK_B, e1) then permute to (BLOCK_B, e0, e1)
-        out2_re = tl.reshape(out2_re, (16, BLOCK_B, 16))
-        out2_im = tl.reshape(out2_im, (16, BLOCK_B, 16))
-        out2_re = tl.permute(out2_re, (1, 0, 2))
-        out2_im = tl.permute(out2_im, (1, 0, 2))
-        # Now output is (BLOCK_B, e0, e1) where k = e0*16 + e1
- 
-        if STORE_T:
-            # Fused FFT-m0+T3 output layout: (B//M, 256, M)
-            # Each row b corresponds to outer_b = b // M, m_idx = b % M
-            # Output: y[outer_b, k, m_idx]
-            out_flat = tl.reshape(out2_re, (BLOCK_B, 256))
-            out_flat_im = tl.reshape(out2_im, (BLOCK_B, 256))
-            # b_offs: actual batch indices
-            outer_b = b_offs // M
-            m_idx = b_offs % M
-            # B_outer = B // M, output shape: (B//M, 256, M)
-            B_outer = B // M
-            out_idx = outer_b[:, None] * (256 * M) + n_offs[None, :] * M + m_idx[:, None]
-            tl.store(y_re_ptr + out_idx, out_flat, mask=mask)
-            tl.store(y_im_ptr + out_idx, out_flat_im, mask=mask)
-        else:
-            out2_re = tl.reshape(out2_re, (BLOCK_B, 256))
-            out2_im = tl.reshape(out2_im, (BLOCK_B, 256))
-            tl.store(y_re_ptr + b_offs[:, None] * 256 + n_offs[None, :], out2_re, mask=mask)
-            tl.store(y_im_ptr + b_offs[:, None] * 256 + n_offs[None, :], out2_im, mask=mask)
+        out2_re_flat = tl.reshape(out2_re, (BLOCK_B, 256))
+        out2_im_flat = tl.reshape(out2_im, (BLOCK_B, 256))
+        tl.store(y_re_ptr + b_offs[:, None] * 256 + n_offs[None, :], out2_re_flat, mask=mask)
+        tl.store(y_im_ptr + b_offs[:, None] * 256 + n_offs[None, :], out2_im_flat, mask=mask)
 
 
 # =============================================================================
@@ -511,8 +500,6 @@ def dft_kernel(
 
     One `_cdot(x_re, x_im, MT_re, MT_im)` call replaces the four `tl.dot`
     expansions; cast its fp32 result to fp16 on store.
-
-    TODO: implement.
     """
     pid = tl.program_id(0)
     b_start = pid * BLOCK_B
@@ -575,8 +562,6 @@ def bailey_scale_kernel(
     produce (rows, M, m0).
 
     Grid: (cdiv(m0, BLOCK_M0), cdiv(M, BLOCK_M), rows).
-
-    TODO: implement.
     """
     pid_m0 = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -680,8 +665,6 @@ def f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B):
       2. F2-A:           length-N2 FFT over (B*N1) signals with Bailey epilogue
       3. T2 (transpose): Z[b, n1, k2] -> Z'[b, k2, n1]
       4. F2-B:           length-N1 FFT over (B*N2) signals with strided store
-
-    TODO: implement.
     """
     N1 = plan['N1']
     N2 = plan['N2']
@@ -740,8 +723,6 @@ def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
       4. T2:    Z[b, n1, k2] -> Z'[b, k2, n1]
       5. FFT-B: length-256 FFT along last axis -> V[b, k2, k1]
       6. T3:    V[b, k2, k1] -> X[b, k1, k2]   (final in b0)
-
-    TODO: implement.
     """
     N1 = plan['N1']  # 256
     N2 = plan['N2']  # 256
@@ -803,8 +784,6 @@ def _f6_rec(cur_re, cur_im, rows, chunks, plan, cyc):
 
     Returns the (re, im) cycler-managed buffers holding the (rows, prod(chunks))
     FFT result.
-
-    TODO: implement.
     """
     m0 = chunks[0]
     M = math.prod(chunks[1:]) if len(chunks) > 1 else 1
@@ -853,8 +832,6 @@ def _f7_rec(cur_re, cur_im, rows, chunks, plan, cyc):
     """Same recursion as _f6_rec but with Scale+T2 fused (store_t=True on
     bailey_scale_kernel) and FFT-m_0+T3 fused (store_t=True, M=M on the inner
     FFT kernel). Output should be bitwise-equal to _f6_rec.
-
-    TODO: implement.
     """
     m0 = chunks[0]
     M = math.prod(chunks[1:]) if len(chunks) > 1 else 1

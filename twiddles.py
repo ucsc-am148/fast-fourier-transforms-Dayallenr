@@ -119,10 +119,15 @@ def make_radix16_twiddles(
         
         t = torch.zeros(cols_per_stage, dtype=torch.float64)
         for j in range(s):
-            # col_labels[j] is at position j (0-indexed among the L-1 column axes)
-            # The digit at position j in c is: (c // 16^(L-2-j)) % 16
-            power = (L - 2 - j)
+            # We explicitly want the digit for e_{L-1-j}
+            target_label = ('e', L - 1 - j)
+            # Find where this label currently sits in the permuted axes
+            idx = col_labels.index(target_label) 
+            
+            # The power of 16 for this axis in the flat index 'c'
+            power = (L - 2 - idx)
             digit_j = (c.long() // (16 ** power)) % 16
+            
             t = t + digit_j.double() * (16.0 ** j)
         
         # tw[s, m, c] = exp(-2*pi*i * m * t(c) / 16^(s+1))
