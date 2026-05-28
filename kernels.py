@@ -70,7 +70,15 @@ def f6_factor(N: int) -> list[int]:
         65536 -> [256, 256]         1048576 -> [256, 256, 16]
         64 -> [16, 4]               2 -> [2]
     """
-    raise NotImplementedError("TODO: implement f6_factor")
+    # TODO
+    assert N >= 2 and (N & (N - 1)) == 0, f"N must be a power of 2 >= 2; got {N}"
+    k = N.bit_length() - 1
+    n256, rb = divmod(k, 8)
+    n16, rb2 = divmod(rb, 4)
+    rsmall = 1 << rb2
+    chunks = [256] * n256 + [16] * n16 + ([rsmall] if rsmall > 1 else [])
+    assert math.prod(chunks) == N
+    return chunks
 
 
 f7_factor = f6_factor   # F7 reuses F6's chunk recipe
